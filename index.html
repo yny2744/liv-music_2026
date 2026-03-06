@@ -1,10 +1,295 @@
-<!DOCTYPE html>
-<html lang="ko">
-<head>
+<!DOCTYPE html><html lang="ko"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>🎵 LIV MUSIC 2026 사업계획 타임테이블</title>
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700;900&amp;display=swap" rel="stylesheet">
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 
@@ -377,30 +662,20 @@ body {
 }
 .memo-add-btn:hover { opacity: 0.9; }
 </style>
-</head>
-<body>
+<style>.ev-c8{background:#6366f1;}.sum-dot.c8{background:#6366f1;}</style></head>
+<body id="artifacts-component-root-html">
 
 <div class="hero-card" style="position:relative;">
   <!-- 관리자 잠금 버튼 (항상 우측 상단) -->
-  <button id="adminLockBtn" onclick="toggleAdminMode()" title="관리자 모드"
-    style="position:absolute;top:14px;right:16px;background:none;border:1.5px solid #ddd;
-    border-radius:10px;padding:6px 12px;cursor:pointer;font-size:13px;color:#bbb;
-    transition:all 0.2s;font-family:inherit;">
-    🔐 관리자
-  </button>
+  <button id="adminLockBtn" onclick="toggleAdminMode()" title="관리자 모드" style="position: absolute; top: 14px; right: 16px; background: linear-gradient(135deg, rgb(124, 58, 237), rgb(236, 72, 153)); border: none; border-radius: 10px; padding: 6px 12px; cursor: pointer; font-size: 13px; color: white; transition: 0.2s; font-family: inherit; font-weight: 700;">🔓 관리자 ON</button>
 
-  <h1 id="heroTitle" style="cursor:default;transition:opacity 0.2s;">
-    🎵 "All about Music Data" LIV MUSIC
-  </h1>
-  <div class="sub" id="pageSubtitle" style="cursor:default;">
-    2026년도 사업계획 연간 타임테이블
-  </div>
+  <h1 id="heroTitle" style="cursor: pointer; transition: opacity 0.2s;" title="클릭하여 수정">🎵 "All about Music Data" 리브뮤직</h1>
+  <div class="sub" id="pageSubtitle" style="cursor: pointer;" title="클릭하여 수정">2026년도 사업계획 일별(출장 및 내근) 타임테이블</div>
 
   <!-- 관리자 전용 툴바 (기본 숨김) -->
-  <div id="adminToolbar" style="display:none;align-items:center;justify-content:center;gap:10px;margin-top:12px;flex-wrap:wrap;
-    background:#faf5ff;border:1.5px dashed #c4b5fd;border-radius:12px;padding:10px 16px;">
+  <div id="adminToolbar" style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 12px; flex-wrap: wrap; background: rgb(250, 245, 255); border: 1.5px dashed rgb(196, 181, 253); border-radius: 12px; padding: 10px 16px;">
     <span style="font-size:11px;font-weight:700;color:#7c3aed;">🔓 관리자 모드</span>
-    <span id="saveStatus" style="font-size:11px;color:#bbb;">💾 자동저장 대기중...</span>
+    <span id="saveStatus" style="font-size: 11px; color: rgb(14, 165, 233);">📂 저장 데이터 복원 (2026. 3. 5. 오전 9:37:41)</span>
     <button onclick="downloadHTML()" style="
       background:linear-gradient(135deg,#7c3aed,#0ea5e9);
       color:white;border:none;border-radius:10px;
@@ -423,10 +698,7 @@ body {
     <div style="font-size:40px;margin-bottom:12px;">🔐</div>
     <div class="memo-modal-title" style="color:#7c3aed;margin-bottom:6px;">관리자 모드</div>
     <div style="font-size:12px;color:#888;margin-bottom:16px;">비밀번호를 입력하세요</div>
-    <input id="adminPwInput" type="password" class="memo-input"
-      placeholder="비밀번호 입력..."
-      onkeydown="if(event.key==='Enter')checkAdminPw()"
-      style="text-align:center;letter-spacing:4px;font-size:16px;margin-bottom:12px;">
+    <input id="adminPwInput" type="password" class="memo-input" placeholder="비밀번호 입력..." onkeydown="if(event.key==='Enter')checkAdminPw()" style="text-align:center;letter-spacing:4px;font-size:16px;margin-bottom:12px;">
     <div id="adminPwError" style="font-size:11px;color:#dc2626;margin-bottom:8px;display:none;">
       ❌ 비밀번호가 틀렸습니다
     </div>
@@ -452,7 +724,7 @@ body {
       <button class="memo-close" onclick="closeMemoModal()">✕</button>
     </div>
     <div class="memo-list" id="memoList"></div>
-    <div class="memo-input-row admin-only" id="memoInputRow" style="display:none;">
+    <div class="memo-input-row admin-only" id="memoInputRow" style="display: flex;">
       <input class="memo-input" id="memoInput" placeholder="업무 제목을 입력하세요..." onkeydown="if(event.key==='Enter')addMemo()">
       <button class="memo-add-btn" onclick="addMemo()">+ 추가</button>
     </div>
@@ -467,7 +739,7 @@ body {
       <button class="memo-close" onclick="closeSchMemoModal()">✕</button>
     </div>
     <div class="memo-list" id="schMemoList"></div>
-    <div class="memo-input-row admin-only" id="schMemoInputRow" style="display:none;">
+    <div class="memo-input-row admin-only" id="schMemoInputRow" style="display: flex;">
       <input class="memo-input" id="schMemoInput" placeholder="출장·내근 업무를 입력하세요..." onkeydown="if(event.key==='Enter')addSchMemo()">
       <button class="memo-add-btn" onclick="addSchMemo()" style="background:linear-gradient(135deg,#0ea5e9,#7c3aed);">+ 추가</button>
     </div>
@@ -479,10 +751,10 @@ body {
 <div class="memo-overlay" id="schNameOverlay" onclick="if(event.target===this)closeSchNameModal()">
   <div class="memo-modal" style="width:420px;max-height:90vh;overflow-y:auto;">
     <div class="memo-modal-head">
-      <div class="memo-modal-title" id="schNameModalTitle" style="color:#f5576c;">👥 인원 현황</div>
+      <div class="memo-modal-title" id="schNameModalTitle" style="color:#f5576c;">3월 9일 인원 현황</div>
       <button class="memo-close" onclick="closeSchNameModal()">✕</button>
     </div>
-    <div id="schNameBody" style="padding:4px 0 8px 0;"></div>
+    <div id="schNameBody" style="padding:4px 0 8px 0;"><div style="background:#f9f9f9;border-radius:10px;padding:10px 12px;margin-bottom:8px;"><div style="font-weight:700;font-size:13px;color:#333;margin-bottom:8px;">👤 연성흠</div><div style="font-size:10px;font-weight:700;color:#888;margin-bottom:4px;">📋 업무 상태</div><div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;"><button onclick="setMemberWork('연성흠','')" style="padding:4px 9px;border-radius:20px;border:2px solid #f5576c;background:#f5576c;color:white;font-size:11px;font-weight:700;cursor:pointer;">🚗 외근</button><button onclick="setMemberWork('연성흠','in')" style="padding:4px 9px;border-radius:20px;border:2px solid #0ea5e9;background:white;color:#0ea5e9;font-size:11px;font-weight:700;cursor:pointer;">💻 내근</button><button onclick="setMemberWork('연성흠','annual')" style="padding:4px 9px;border-radius:20px;border:2px solid #16a34a;background:white;color:#16a34a;font-size:11px;font-weight:700;cursor:pointer;">🌴 연차</button><button onclick="setMemberWork('연성흠','am')" style="padding:4px 9px;border-radius:20px;border:2px solid #f59e0b;background:white;color:#f59e0b;font-size:11px;font-weight:700;cursor:pointer;">🌅 오전반차</button><button onclick="setMemberWork('연성흠','pm')" style="padding:4px 9px;border-radius:20px;border:2px solid #8b5cf6;background:white;color:#8b5cf6;font-size:11px;font-weight:700;cursor:pointer;">🌇 오후반차</button></div><div style="font-size:10px;font-weight:700;color:#888;margin-bottom:4px;">🕐 출근 구분 (선택)</div><div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;"><button onclick="setMemberArrive('연성흠','lateam')" style="padding:4px 9px;border-radius:20px;border:2px solid #06b6d4;background:white;color:#06b6d4;font-size:11px;font-weight:700;cursor:pointer;">🌄 오전출근</button><button onclick="setMemberArrive('연성흠','')" style="padding:4px 9px;border-radius:20px;border:2px solid #7c3aed;background:#7c3aed;color:white;font-size:11px;font-weight:700;cursor:pointer;">🌆 오후출근</button></div><input id="region_연성흠" class="memo-input" placeholder="📍 출장 지역" value="" style="margin-bottom:5px;"><textarea id="task_연성흠" style="width:100%;border:1.5px solid #e0c8ff;border-radius:8px;padding:6px 10px;font-size:11px;font-family:inherit;resize:none;height:50px;" placeholder="📋 업무 내용"></textarea></div><div style="background:#f9f9f9;border-radius:10px;padding:10px 12px;margin-bottom:8px;"><div style="font-weight:700;font-size:13px;color:#333;margin-bottom:8px;">👤 유남영</div><div style="font-size:10px;font-weight:700;color:#888;margin-bottom:4px;">📋 업무 상태</div><div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;"><button onclick="setMemberWork('유남영','out')" style="padding:4px 9px;border-radius:20px;border:2px solid #f5576c;background:white;color:#f5576c;font-size:11px;font-weight:700;cursor:pointer;">🚗 외근</button><button onclick="setMemberWork('유남영','')" style="padding:4px 9px;border-radius:20px;border:2px solid #0ea5e9;background:#0ea5e9;color:white;font-size:11px;font-weight:700;cursor:pointer;">💻 내근</button><button onclick="setMemberWork('유남영','annual')" style="padding:4px 9px;border-radius:20px;border:2px solid #16a34a;background:white;color:#16a34a;font-size:11px;font-weight:700;cursor:pointer;">🌴 연차</button><button onclick="setMemberWork('유남영','am')" style="padding:4px 9px;border-radius:20px;border:2px solid #f59e0b;background:white;color:#f59e0b;font-size:11px;font-weight:700;cursor:pointer;">🌅 오전반차</button><button onclick="setMemberWork('유남영','pm')" style="padding:4px 9px;border-radius:20px;border:2px solid #8b5cf6;background:white;color:#8b5cf6;font-size:11px;font-weight:700;cursor:pointer;">🌇 오후반차</button></div><div style="font-size:10px;font-weight:700;color:#888;margin-bottom:4px;">🕐 출근 구분 (선택)</div><div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;"><button onclick="setMemberArrive('유남영','')" style="padding:4px 9px;border-radius:20px;border:2px solid #06b6d4;background:#06b6d4;color:white;font-size:11px;font-weight:700;cursor:pointer;">🌄 오전출근</button><button onclick="setMemberArrive('유남영','latepm')" style="padding:4px 9px;border-radius:20px;border:2px solid #7c3aed;background:white;color:#7c3aed;font-size:11px;font-weight:700;cursor:pointer;">🌆 오후출근</button></div><input id="memo_유남영" class="memo-input" placeholder="📝 메모 (선택)" value="" style="margin-top:2px;"></div><div style="background:#f9f9f9;border-radius:10px;padding:10px 12px;margin-bottom:8px;"><div style="font-weight:700;font-size:13px;color:#333;margin-bottom:8px;">👤 김동희</div><div style="font-size:10px;font-weight:700;color:#888;margin-bottom:4px;">📋 업무 상태</div><div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;"><button onclick="setMemberWork('김동희','out')" style="padding:4px 9px;border-radius:20px;border:2px solid #f5576c;background:white;color:#f5576c;font-size:11px;font-weight:700;cursor:pointer;">🚗 외근</button><button onclick="setMemberWork('김동희','')" style="padding:4px 9px;border-radius:20px;border:2px solid #0ea5e9;background:#0ea5e9;color:white;font-size:11px;font-weight:700;cursor:pointer;">💻 내근</button><button onclick="setMemberWork('김동희','annual')" style="padding:4px 9px;border-radius:20px;border:2px solid #16a34a;background:white;color:#16a34a;font-size:11px;font-weight:700;cursor:pointer;">🌴 연차</button><button onclick="setMemberWork('김동희','am')" style="padding:4px 9px;border-radius:20px;border:2px solid #f59e0b;background:white;color:#f59e0b;font-size:11px;font-weight:700;cursor:pointer;">🌅 오전반차</button><button onclick="setMemberWork('김동희','pm')" style="padding:4px 9px;border-radius:20px;border:2px solid #8b5cf6;background:white;color:#8b5cf6;font-size:11px;font-weight:700;cursor:pointer;">🌇 오후반차</button></div><div style="font-size:10px;font-weight:700;color:#888;margin-bottom:4px;">🕐 출근 구분 (선택)</div><div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;"><button onclick="setMemberArrive('김동희','')" style="padding:4px 9px;border-radius:20px;border:2px solid #06b6d4;background:#06b6d4;color:white;font-size:11px;font-weight:700;cursor:pointer;">🌄 오전출근</button><button onclick="setMemberArrive('김동희','latepm')" style="padding:4px 9px;border-radius:20px;border:2px solid #7c3aed;background:white;color:#7c3aed;font-size:11px;font-weight:700;cursor:pointer;">🌆 오후출근</button></div><input id="memo_김동희" class="memo-input" placeholder="📝 메모 (선택)" value="" style="margin-top:2px;"></div><div style="background:#f9f9f9;border-radius:10px;padding:10px 12px;margin-bottom:8px;"><div style="font-weight:700;font-size:13px;color:#333;margin-bottom:8px;">👤 박재훈</div><div style="font-size:10px;font-weight:700;color:#888;margin-bottom:4px;">📋 업무 상태</div><div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;"><button onclick="setMemberWork('박재훈','')" style="padding:4px 9px;border-radius:20px;border:2px solid #f5576c;background:#f5576c;color:white;font-size:11px;font-weight:700;cursor:pointer;">🚗 외근</button><button onclick="setMemberWork('박재훈','in')" style="padding:4px 9px;border-radius:20px;border:2px solid #0ea5e9;background:white;color:#0ea5e9;font-size:11px;font-weight:700;cursor:pointer;">💻 내근</button><button onclick="setMemberWork('박재훈','annual')" style="padding:4px 9px;border-radius:20px;border:2px solid #16a34a;background:white;color:#16a34a;font-size:11px;font-weight:700;cursor:pointer;">🌴 연차</button><button onclick="setMemberWork('박재훈','am')" style="padding:4px 9px;border-radius:20px;border:2px solid #f59e0b;background:white;color:#f59e0b;font-size:11px;font-weight:700;cursor:pointer;">🌅 오전반차</button><button onclick="setMemberWork('박재훈','pm')" style="padding:4px 9px;border-radius:20px;border:2px solid #8b5cf6;background:white;color:#8b5cf6;font-size:11px;font-weight:700;cursor:pointer;">🌇 오후반차</button></div><div style="font-size:10px;font-weight:700;color:#888;margin-bottom:4px;">🕐 출근 구분 (선택)</div><div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;"><button onclick="setMemberArrive('박재훈','lateam')" style="padding:4px 9px;border-radius:20px;border:2px solid #06b6d4;background:white;color:#06b6d4;font-size:11px;font-weight:700;cursor:pointer;">🌄 오전출근</button><button onclick="setMemberArrive('박재훈','')" style="padding:4px 9px;border-radius:20px;border:2px solid #7c3aed;background:#7c3aed;color:white;font-size:11px;font-weight:700;cursor:pointer;">🌆 오후출근</button></div><input id="region_박재훈" class="memo-input" placeholder="📍 출장 지역" value="" style="margin-bottom:5px;"><textarea id="task_박재훈" style="width:100%;border:1.5px solid #e0c8ff;border-radius:8px;padding:6px 10px;font-size:11px;font-family:inherit;resize:none;height:50px;" placeholder="📋 업무 내용"></textarea></div><div style="background:#f9f9f9;border-radius:10px;padding:10px 12px;margin-bottom:8px;"><div style="font-weight:700;font-size:13px;color:#333;margin-bottom:8px;">👤 김훈기</div><div style="font-size:10px;font-weight:700;color:#888;margin-bottom:4px;">📋 업무 상태</div><div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;"><button onclick="setMemberWork('김훈기','out')" style="padding:4px 9px;border-radius:20px;border:2px solid #f5576c;background:white;color:#f5576c;font-size:11px;font-weight:700;cursor:pointer;">🚗 외근</button><button onclick="setMemberWork('김훈기','')" style="padding:4px 9px;border-radius:20px;border:2px solid #0ea5e9;background:#0ea5e9;color:white;font-size:11px;font-weight:700;cursor:pointer;">💻 내근</button><button onclick="setMemberWork('김훈기','annual')" style="padding:4px 9px;border-radius:20px;border:2px solid #16a34a;background:white;color:#16a34a;font-size:11px;font-weight:700;cursor:pointer;">🌴 연차</button><button onclick="setMemberWork('김훈기','am')" style="padding:4px 9px;border-radius:20px;border:2px solid #f59e0b;background:white;color:#f59e0b;font-size:11px;font-weight:700;cursor:pointer;">🌅 오전반차</button><button onclick="setMemberWork('김훈기','pm')" style="padding:4px 9px;border-radius:20px;border:2px solid #8b5cf6;background:white;color:#8b5cf6;font-size:11px;font-weight:700;cursor:pointer;">🌇 오후반차</button></div><div style="font-size:10px;font-weight:700;color:#888;margin-bottom:4px;">🕐 출근 구분 (선택)</div><div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;"><button onclick="setMemberArrive('김훈기','')" style="padding:4px 9px;border-radius:20px;border:2px solid #06b6d4;background:#06b6d4;color:white;font-size:11px;font-weight:700;cursor:pointer;">🌄 오전출근</button><button onclick="setMemberArrive('김훈기','latepm')" style="padding:4px 9px;border-radius:20px;border:2px solid #7c3aed;background:white;color:#7c3aed;font-size:11px;font-weight:700;cursor:pointer;">🌆 오후출근</button></div><input id="memo_김훈기" class="memo-input" placeholder="📝 메모 (선택)" value="" style="margin-top:2px;"></div></div>
     <div style="display:flex;gap:8px;margin-top:8px;">
       <button onclick="saveSchNames_modal()" style="flex:1;padding:10px;background:linear-gradient(135deg,#f5576c,#0ea5e9);color:white;border:none;border-radius:10px;font-weight:700;font-size:13px;cursor:pointer;">💾 저장</button>
       <button onclick="clearSchNames_modal()" style="flex:0 0 70px;padding:10px;background:#f3f4f6;color:#666;border:none;border-radius:10px;font-weight:600;font-size:12px;cursor:pointer;">🗑 초기화</button>
@@ -562,8 +834,7 @@ body {
 
       <!-- 카테고리 선택 -->
       <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;">
-        <select id="sumNewCat" onchange="toggleNewCatInput()"
-          style="flex:1;font-size:11px;border:1.5px solid #e0c8ff;border-radius:6px;padding:5px 8px;font-family:inherit;color:#555;">
+        <select id="sumNewCat" onchange="toggleNewCatInput()" style="flex:1;font-size:11px;border:1.5px solid #e0c8ff;border-radius:6px;padding:5px 8px;font-family:inherit;color:#555;">
           <option value="c1">프랜차이즈 일괄징수</option>
           <option value="c2">중앙회 협력</option>
           <option value="c3">대상업소 개발/전국 확대</option>
@@ -577,15 +848,12 @@ body {
 
       <!-- 새 카테고리 직접 입력 영역 (숨김) -->
       <div id="newCatInputArea" style="display:none;gap:8px;margin-bottom:8px;align-items:center;flex-wrap:wrap;">
-        <input id="sumNewCatName" class="memo-input" placeholder="카테고리명 (예: 회계·총무)"
-          style="flex:1;font-size:12px;min-width:140px;">
+        <input id="sumNewCatName" class="memo-input" placeholder="카테고리명 (예: 회계·총무)" style="flex:1;font-size:12px;min-width:140px;">
         <div style="display:flex;align-items:center;gap:6px;">
           <label style="font-size:11px;color:#555;">색상:</label>
-          <input type="color" id="sumNewCatColor" value="#6366f1"
-            style="width:36px;height:30px;border:none;border-radius:6px;cursor:pointer;padding:2px;">
+          <input type="color" id="sumNewCatColor" value="#6366f1" style="width:36px;height:30px;border:none;border-radius:6px;cursor:pointer;padding:2px;">
         </div>
-        <button onclick="addNewCategory()"
-          style="background:linear-gradient(135deg,#7c3aed,#ec4899);color:white;border:none;
+        <button onclick="addNewCategory()" style="background:linear-gradient(135deg,#7c3aed,#ec4899);color:white;border:none;
           border-radius:8px;padding:6px 12px;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap;">
           카테고리 생성
         </button>
@@ -593,14 +861,12 @@ body {
 
       <!-- 내용 입력 -->
       <div style="display:flex;gap:8px;">
-        <input id="sumNewText" class="memo-input" placeholder="요약 내용 입력..."
-          onkeydown="if(event.key==='Enter')addSummaryItem()" style="font-size:12px;">
+        <input id="sumNewText" class="memo-input" placeholder="요약 내용 입력..." onkeydown="if(event.key==='Enter')addSummaryItem()" style="font-size:12px;">
         <button class="memo-add-btn" onclick="addSummaryItem()">+ 추가</button>
       </div>
     </div>
 
-    <button onclick="closeSumEditModal()"
-      style="width:100%;padding:10px;background:linear-gradient(135deg,#7c3aed,#ec4899);
+    <button onclick="closeSumEditModal()" style="width:100%;padding:10px;background:linear-gradient(135deg,#7c3aed,#ec4899);
       color:white;border:none;border-radius:10px;font-size:13px;font-weight:700;
       cursor:pointer;font-family:inherit;">✅ 저장 완료</button>
   </div>
@@ -615,13 +881,10 @@ body {
     </div>
     <div id="weekEditList" style="max-height:260px;overflow-y:auto;margin-bottom:12px;"></div>
     <div class="memo-input-row" style="margin-bottom:10px;">
-      <input class="memo-input" id="weekEditNewInput" placeholder="새 업무 항목 입력..."
-        onkeydown="if(event.key==='Enter')addWeekItemInModal()">
-      <button class="memo-add-btn" onclick="addWeekItemInModal()"
-        style="background:linear-gradient(135deg,#16a34a,#0891b2);">+ 추가</button>
+      <input class="memo-input" id="weekEditNewInput" placeholder="새 업무 항목 입력..." onkeydown="if(event.key==='Enter')addWeekItemInModal()">
+      <button class="memo-add-btn" onclick="addWeekItemInModal()" style="background:linear-gradient(135deg,#16a34a,#0891b2);">+ 추가</button>
     </div>
-    <button onclick="closeWeekEditModal()"
-      style="width:100%;padding:10px;background:linear-gradient(135deg,#16a34a,#0891b2);
+    <button onclick="closeWeekEditModal()" style="width:100%;padding:10px;background:linear-gradient(135deg,#16a34a,#0891b2);
       color:white;border:none;border-radius:10px;font-size:13px;font-weight:700;
       cursor:pointer;font-family:inherit;">✅ 저장 완료</button>
   </div>
@@ -662,7 +925,7 @@ body {
 </div>
 
 <!-- YEAR VIEW -->
-<div id="yearView" class="view active">
+<div id="yearView" class="view">
   <div class="guide-banner" style="margin-bottom:16px;">
     <span class="guide-icon">🗓</span>
     <div class="guide-text">
@@ -671,7 +934,679 @@ body {
     </div>
     <span class="guide-arrow">👆</span>
   </div>
-  <div id="yearContent"></div>
+  <div id="yearContent"><div class="q-label">Q1 · 기반 구축 단계</div><div class="year-grid-wrap"><div class="month-card">
+        <div class="mc-head" style="background:linear-gradient(135deg, #b8cce4, #7a9cbf)">
+          <div>
+            <div class="mnum">01</div>
+            <div class="mname">1월</div>
+            <div style="font-size:13px;opacity:0.92;margin-top:4px;font-weight:600;letter-spacing:0.5px;">❄️ 새해의 첫 발걸음, LIV가 앞서갑니다!</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button onclick="event.stopPropagation();openSummaryEdit(1)" class="admin-only" style="display:inline-block;background:rgba(255,255,255,0.25);border:none;border-radius:6px;
+              color:white;font-size:12px;cursor:pointer;padding:4px 8px;font-weight:700;" title="1월 요약 편집">✏️</button>
+            <div class="arr">→</div>
+          </div>
+        </div>
+        <div class="mc-body">
+          <div class="kw">월별 주요 업무 요약</div>
+          <div class="sum-list" id="sumList_1">
+        <div class="sum-row">
+          <span class="sum-dot c1"></span>
+          <span class="sum-cat">프랜차이즈 일괄징수</span>
+          <span class="sum-text">DB 구축 착수 · 공공데이터 생성</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c2"></span>
+          <span class="sum-cat">중앙회 협력</span>
+          <span class="sum-text">중앙회 담당자 접촉 · 협력 초기 논의</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c7"></span>
+          <span class="sum-cat">시스템 개발</span>
+          <span class="sum-text">시스템 개발 착수 · 요구사항 정의</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c3"></span>
+          <span class="sum-cat">대상업소 개발 / 전국 확대</span>
+          <span class="sum-text">수도권 업소 DB 수집 (3,483개소)</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c4"></span>
+          <span class="sum-cat">KOMCA 공연권</span>
+          <span class="sum-text">KOMCA 위탁 실무협의 개시</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c5"></span>
+          <span class="sum-cat">정책과제</span>
+          <span class="sum-text">국고지원사업 기획 착수</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c6"></span>
+          <span class="sum-cat">홍보·커뮤니케이션</span>
+          <span class="sum-text">브랜딩·언론 전략 수립</span>
+        </div>
+      </div>
+        </div></div><div class="month-card">
+        <div class="mc-head" style="background:linear-gradient(135deg, #c9b8e8, #9b7fd4)">
+          <div>
+            <div class="mnum">02</div>
+            <div class="mname">2월</div>
+            <div style="font-size:13px;opacity:0.92;margin-top:4px;font-weight:600;letter-spacing:0.5px;">🌱 봄을 향해 달려가는 LIV의 에너지!</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button onclick="event.stopPropagation();openSummaryEdit(2)" class="admin-only" style="display:inline-block;background:rgba(255,255,255,0.25);border:none;border-radius:6px;
+              color:white;font-size:12px;cursor:pointer;padding:4px 8px;font-weight:700;" title="2월 요약 편집">✏️</button>
+            <div class="arr">→</div>
+          </div>
+        </div>
+        <div class="mc-body">
+          <div class="kw">월별 주요 업무 요약</div>
+          <div class="sum-list" id="sumList_2">
+        <div class="sum-row">
+          <span class="sum-dot c1"></span>
+          <span class="sum-cat">프랜차이즈 일괄징수</span>
+          <span class="sum-text">가맹사업 본사 안내공문 발송</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c2"></span>
+          <span class="sum-cat">중앙회 협력</span>
+          <span class="sum-text">중앙회 MOU 협의 준비 · 담당자 접촉</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c4"></span>
+          <span class="sum-cat">KOMCA 공연권</span>
+          <span class="sum-text">KOMCA 위탁 실무협의 진행</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c7"></span>
+          <span class="sum-cat">시스템 개발</span>
+          <span class="sum-text">시스템 개발 요구사항 확정</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c3"></span>
+          <span class="sum-cat">대상업소 개발 / 전국 확대</span>
+          <span class="sum-text">수도권 업소 DB 구축 지속</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c5"></span>
+          <span class="sum-cat">정책과제</span>
+          <span class="sum-text">국고지원사업 기획안 작성</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c6"></span>
+          <span class="sum-cat">홍보·커뮤니케이션</span>
+          <span class="sum-text">홍보 실행 로드맵 수립</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c8"></span>
+          <span class="sum-cat">회계</span>
+          <span class="sum-text">매달 25일 급여 이체</span>
+        </div>
+      </div>
+        </div></div><div class="month-card">
+        <div class="mc-head" style="background:linear-gradient(135deg, #a8d5a2, #5a9e52)">
+          <div>
+            <div class="mnum">03</div>
+            <div class="mname">3월</div>
+            <div style="font-size:13px;opacity:0.92;margin-top:4px;font-weight:600;letter-spacing:0.5px;">🌸 새싹처럼 힘차게, LIV와 함께 피어나요!</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button onclick="event.stopPropagation();openSummaryEdit(3)" class="admin-only" style="display:inline-block;background:rgba(255,255,255,0.25);border:none;border-radius:6px;
+              color:white;font-size:12px;cursor:pointer;padding:4px 8px;font-weight:700;" title="3월 요약 편집">✏️</button>
+            <div class="arr">→</div>
+          </div>
+        </div>
+        <div class="mc-body">
+          <div class="kw">월별 주요 업무 요약</div>
+          <div class="sum-list" id="sumList_3">
+        <div class="sum-row">
+          <span class="sum-dot c1"></span>
+          <span class="sum-cat">프랜차이즈 일괄징수</span>
+          <span class="sum-text">본사 접촉 · 업무협의 개시</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c2"></span>
+          <span class="sum-cat">중앙회 협력</span>
+          <span class="sum-text">중앙회 MOU 초안 도출</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c7"></span>
+          <span class="sum-cat">시스템 개발</span>
+          <span class="sum-text">시스템 개발 착수 · 1차 프로토타입</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c3"></span>
+          <span class="sum-cat">대상업소 개발 / 전국 확대</span>
+          <span class="sum-text">수도권 현장 방문 · 개발 개시</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c4"></span>
+          <span class="sum-cat">KOMCA 공연권</span>
+          <span class="sum-text">KOMCA 위탁 실무협의 지속</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c5"></span>
+          <span class="sum-cat">정책과제</span>
+          <span class="sum-text">국고지원사업 기획안 완성</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c6"></span>
+          <span class="sum-cat">홍보·커뮤니케이션</span>
+          <span class="sum-text">홍보 로드맵 수립 완료</span>
+        </div>
+      </div>
+        </div></div></div><div class="q-label">Q2 · 수도권 성과 가시화</div><div class="year-grid-wrap"><div class="month-card">
+        <div class="mc-head" style="background:linear-gradient(135deg, #f7c5d5, #e87fa3)">
+          <div>
+            <div class="mnum">04</div>
+            <div class="mname">4월</div>
+            <div style="font-size:13px;opacity:0.92;margin-top:4px;font-weight:600;letter-spacing:0.5px;">🌺 벚꽃처럼 활짝, LIV의 봄이 빛납니다!</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button onclick="event.stopPropagation();openSummaryEdit(4)" class="admin-only" style="display:inline-block;background:rgba(255,255,255,0.25);border:none;border-radius:6px;
+              color:white;font-size:12px;cursor:pointer;padding:4px 8px;font-weight:700;" title="4월 요약 편집">✏️</button>
+            <div class="arr">→</div>
+          </div>
+        </div>
+        <div class="mc-body">
+          <div class="kw">월별 주요 업무 요약</div>
+          <div class="sum-list" id="sumList_4">
+        <div class="sum-row">
+          <span class="sum-dot c1"></span>
+          <span class="sum-cat">프랜차이즈 일괄징수</span>
+          <span class="sum-text">본사 MOU 체결 · 직영점 일괄납부 추진</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c2"></span>
+          <span class="sum-cat">중앙회 협력</span>
+          <span class="sum-text">중앙회 3자 협력체계 구축</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c7"></span>
+          <span class="sum-cat">시스템 개발</span>
+          <span class="sum-text">통합징수 시스템 1차 개발 착수</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c3"></span>
+          <span class="sum-cat">대상업소 개발 / 전국 확대</span>
+          <span class="sum-text">수도권 안내문 발송 · 1유형 징수 확대</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c4"></span>
+          <span class="sum-cat">KOMCA 공연권</span>
+          <span class="sum-text">통합징수 운영모델 설계</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c5"></span>
+          <span class="sum-cat">정책과제</span>
+          <span class="sum-text">정부·국회 협의 본격화</span>
+        </div>
+      </div>
+        </div></div><div class="month-card">
+        <div class="mc-head" style="background:linear-gradient(135deg, #4caf7d, #1e7d47)">
+          <div>
+            <div class="mnum">05</div>
+            <div class="mname">5월</div>
+            <div style="font-size:13px;opacity:0.92;margin-top:4px;font-weight:600;letter-spacing:0.5px;">💚 싱그러운 5월, LIV의 성장이 눈부십니다!</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button onclick="event.stopPropagation();openSummaryEdit(5)" class="admin-only" style="display:inline-block;background:rgba(255,255,255,0.25);border:none;border-radius:6px;
+              color:white;font-size:12px;cursor:pointer;padding:4px 8px;font-weight:700;" title="5월 요약 편집">✏️</button>
+            <div class="arr">→</div>
+          </div>
+        </div>
+        <div class="mc-body">
+          <div class="kw">월별 주요 업무 요약</div>
+          <div class="sum-list" id="sumList_5">
+        <div class="sum-row">
+          <span class="sum-dot c1"></span>
+          <span class="sum-cat">프랜차이즈 일괄징수</span>
+          <span class="sum-text">본사 협약 확대 · 아웃바운드 상담</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c2"></span>
+          <span class="sum-cat">중앙회 협력</span>
+          <span class="sum-text">중앙회 협력 지속 · 자율납부 유도</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c7"></span>
+          <span class="sum-cat">시스템 개발</span>
+          <span class="sum-text">시스템 1차 개발 지속</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c3"></span>
+          <span class="sum-cat">대상업소 개발 / 전국 확대</span>
+          <span class="sum-text">수도권 실징수 전환율 제고</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c4"></span>
+          <span class="sum-cat">KOMCA 공연권</span>
+          <span class="sum-text">KOMCA 운영모델 제안서 도출</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c5"></span>
+          <span class="sum-cat">정책과제</span>
+          <span class="sum-text">국고지원사업 계획 수립 지속</span>
+        </div>
+      </div>
+        </div></div><div class="month-card">
+        <div class="mc-head" style="background:linear-gradient(135deg, #5bc8e8, #1a9abf)">
+          <div>
+            <div class="mnum">06</div>
+            <div class="mname">6월</div>
+            <div style="font-size:13px;opacity:0.92;margin-top:4px;font-weight:600;letter-spacing:0.5px;">☀️ 뜨거운 열정으로, LIV가 하늘을 가릅니다!</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button onclick="event.stopPropagation();openSummaryEdit(6)" class="admin-only" style="display:inline-block;background:rgba(255,255,255,0.25);border:none;border-radius:6px;
+              color:white;font-size:12px;cursor:pointer;padding:4px 8px;font-weight:700;" title="6월 요약 편집">✏️</button>
+            <div class="arr">→</div>
+          </div>
+        </div>
+        <div class="mc-body">
+          <div class="kw">월별 주요 업무 요약</div>
+          <div class="sum-list" id="sumList_6">
+        <div class="sum-row">
+          <span class="sum-dot c1"></span>
+          <span class="sum-cat">프랜차이즈 일괄징수</span>
+          <span class="sum-text">MOU 체결 성과 확정 · 일괄납부 완료</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c2"></span>
+          <span class="sum-cat">중앙회 협력</span>
+          <span class="sum-text">중앙회 협력 성과 점검</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c7"></span>
+          <span class="sum-cat">시스템 개발</span>
+          <span class="sum-text">시스템 1차 개발 완료</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c3"></span>
+          <span class="sum-cat">대상업소 개발 / 전국 확대</span>
+          <span class="sum-text">수도권 실징수 전환 성과 가시화</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c4"></span>
+          <span class="sum-cat">KOMCA 공연권</span>
+          <span class="sum-text">KOMCA 최종 제안서 제출</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c5"></span>
+          <span class="sum-cat">정책과제</span>
+          <span class="sum-text">국고지원사업 계획 수립 완료</span>
+        </div>
+      </div>
+        </div></div></div><div class="q-label">Q3 · 수도권 안정화 + 전국 기반 구축</div><div class="year-grid-wrap"><div class="month-card">
+        <div class="mc-head" style="background:linear-gradient(135deg, #1565c0, #0d3b7a)">
+          <div>
+            <div class="mnum">07</div>
+            <div class="mname">7월</div>
+            <div style="font-size:13px;opacity:0.92;margin-top:4px;font-weight:600;letter-spacing:0.5px;">🌊 파도처럼 거침없이, LIV 파이팅!</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button onclick="event.stopPropagation();openSummaryEdit(7)" class="admin-only" style="display:inline-block;background:rgba(255,255,255,0.25);border:none;border-radius:6px;
+              color:white;font-size:12px;cursor:pointer;padding:4px 8px;font-weight:700;" title="7월 요약 편집">✏️</button>
+            <div class="arr">→</div>
+          </div>
+        </div>
+        <div class="mc-body">
+          <div class="kw">월별 주요 업무 요약</div>
+          <div class="sum-list" id="sumList_7">
+        <div class="sum-row">
+          <span class="sum-dot c1"></span>
+          <span class="sum-cat">프랜차이즈 일괄징수</span>
+          <span class="sum-text">추가 본사 협약 확대 공문 작성</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c2"></span>
+          <span class="sum-cat">중앙회 협력</span>
+          <span class="sum-text">중앙회 지역지부 연계 협력 착수</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c7"></span>
+          <span class="sum-cat">시스템 개발</span>
+          <span class="sum-text">시스템 시범운영 착수</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c3"></span>
+          <span class="sum-cat">대상업소 개발 / 전국 확대</span>
+          <span class="sum-text">미납업소 전환 · 지역센터 구축 계획</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c4"></span>
+          <span class="sum-cat">KOMCA 공연권</span>
+          <span class="sum-text">KOMCA 위탁 조건 협상 착수</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c5"></span>
+          <span class="sum-cat">정책과제</span>
+          <span class="sum-text">보상금 고시 확대 준비 · 국고 집행</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c6"></span>
+          <span class="sum-cat">홍보·커뮤니케이션</span>
+          <span class="sum-text">소상공인 공청회·토론회 개최</span>
+        </div>
+      </div>
+        </div></div><div class="month-card">
+        <div class="mc-head" style="background:linear-gradient(135deg, #f9c730, #e8960a)">
+          <div>
+            <div class="mnum">08</div>
+            <div class="mname">8월</div>
+            <div style="font-size:13px;opacity:0.92;margin-top:4px;font-weight:600;letter-spacing:0.5px;">🌻 해바라기처럼 당당하게, LIV가 빛납니다!</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button onclick="event.stopPropagation();openSummaryEdit(8)" class="admin-only" style="display:inline-block;background:rgba(255,255,255,0.25);border:none;border-radius:6px;
+              color:white;font-size:12px;cursor:pointer;padding:4px 8px;font-weight:700;" title="8월 요약 편집">✏️</button>
+            <div class="arr">→</div>
+          </div>
+        </div>
+        <div class="mc-body">
+          <div class="kw">월별 주요 업무 요약</div>
+          <div class="sum-list" id="sumList_8">
+        <div class="sum-row">
+          <span class="sum-dot c1"></span>
+          <span class="sum-cat">프랜차이즈 일괄징수</span>
+          <span class="sum-text">본사 협약 확대 지속</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c2"></span>
+          <span class="sum-cat">중앙회 협력</span>
+          <span class="sum-text">중앙회 지역지부 연계 협력 진행</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c7"></span>
+          <span class="sum-cat">시스템 개발</span>
+          <span class="sum-text">시스템 공공DB 자동화 검증</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c3"></span>
+          <span class="sum-cat">대상업소 개발 / 전국 확대</span>
+          <span class="sum-text">대형시설 관리 체계 운영</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c4"></span>
+          <span class="sum-cat">KOMCA 공연권</span>
+          <span class="sum-text">KOMCA 위탁 조건 협상 진행</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c6"></span>
+          <span class="sum-cat">홍보·커뮤니케이션</span>
+          <span class="sum-text">공청회 결과 언론 기사화</span>
+        </div>
+      </div>
+        </div></div><div class="month-card">
+        <div class="mc-head" style="background:linear-gradient(135deg, #f4a24a, #d4721a)">
+          <div>
+            <div class="mnum">09</div>
+            <div class="mname">9월</div>
+            <div style="font-size:13px;opacity:0.92;margin-top:4px;font-weight:600;letter-spacing:0.5px;">🍂 결실의 계절, LIV의 노력이 빛을 발합니다!</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button onclick="event.stopPropagation();openSummaryEdit(9)" class="admin-only" style="display:inline-block;background:rgba(255,255,255,0.25);border:none;border-radius:6px;
+              color:white;font-size:12px;cursor:pointer;padding:4px 8px;font-weight:700;" title="9월 요약 편집">✏️</button>
+            <div class="arr">→</div>
+          </div>
+        </div>
+        <div class="mc-body">
+          <div class="kw">월별 주요 업무 요약</div>
+          <div class="sum-list" id="sumList_9">
+        <div class="sum-row">
+          <span class="sum-dot c1"></span>
+          <span class="sum-cat">프랜차이즈 일괄징수</span>
+          <span class="sum-text">본사 협약 성과 최종 확정</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c2"></span>
+          <span class="sum-cat">중앙회 협력</span>
+          <span class="sum-text">중앙회 협력 3분기 성과 정리</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c7"></span>
+          <span class="sum-cat">시스템 개발</span>
+          <span class="sum-text">시스템 시범운영 성과 정리</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c3"></span>
+          <span class="sum-cat">대상업소 개발 / 전국 확대</span>
+          <span class="sum-text">전국 징수 운영모델 확정 완료</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c4"></span>
+          <span class="sum-cat">KOMCA 공연권</span>
+          <span class="sum-text">KOMCA 위탁 조건 협의 성과 도출</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c5"></span>
+          <span class="sum-cat">정책과제</span>
+          <span class="sum-text">저작인접권 고시 확대 근거 확보</span>
+        </div>
+      </div>
+        </div></div></div><div class="q-label">Q4 · 전국 운영 고도화</div><div class="year-grid-wrap"><div class="month-card">
+        <div class="mc-head" style="background:linear-gradient(135deg, #d94f38, #a02820)">
+          <div>
+            <div class="mnum">10</div>
+            <div class="mname">10월</div>
+            <div style="font-size:13px;opacity:0.92;margin-top:4px;font-weight:600;letter-spacing:0.5px;">🍁 단풍처럼 화려하게, LIV의 성과를 물들여요!</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button onclick="event.stopPropagation();openSummaryEdit(10)" class="admin-only" style="display:inline-block;background:rgba(255,255,255,0.25);border:none;border-radius:6px;
+              color:white;font-size:12px;cursor:pointer;padding:4px 8px;font-weight:700;" title="10월 요약 편집">✏️</button>
+            <div class="arr">→</div>
+          </div>
+        </div>
+        <div class="mc-body">
+          <div class="kw">월별 주요 업무 요약</div>
+          <div class="sum-list" id="sumList_10">
+        <div class="sum-row">
+          <span class="sum-dot c1"></span>
+          <span class="sum-cat">프랜차이즈 일괄징수</span>
+          <span class="sum-text">전국 단위 프랜차이즈 일괄 청구</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c2"></span>
+          <span class="sum-cat">중앙회 협력</span>
+          <span class="sum-text">중앙회 지역지부 연계 징수 확대</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c7"></span>
+          <span class="sum-cat">시스템 개발</span>
+          <span class="sum-text">통합징수 시스템 정식 운영</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c3"></span>
+          <span class="sum-cat">대상업소 개발 / 전국 확대</span>
+          <span class="sum-text">지역센터 징수 실행 · 전국 확산</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c4"></span>
+          <span class="sum-cat">KOMCA 공연권</span>
+          <span class="sum-text">KOMCA 위탁계약 체결 · 실징수 시작</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c5"></span>
+          <span class="sum-cat">정책과제</span>
+          <span class="sum-text">시행령 개정 공식 요청</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c6"></span>
+          <span class="sum-cat">홍보·커뮤니케이션</span>
+          <span class="sum-text">연말 성과 보도 · SNS 채널 운영</span>
+        </div>
+      </div>
+        </div></div><div class="month-card">
+        <div class="mc-head" style="background:linear-gradient(135deg, #9e7b4f, #6b4f2a)">
+          <div>
+            <div class="mnum">11</div>
+            <div class="mname">11월</div>
+            <div style="font-size:13px;opacity:0.92;margin-top:4px;font-weight:600;letter-spacing:0.5px;">🎯 마무리도 완벽하게, LIV의 도전은 멈추지 않아요!</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button onclick="event.stopPropagation();openSummaryEdit(11)" class="admin-only" style="display:inline-block;background:rgba(255,255,255,0.25);border:none;border-radius:6px;
+              color:white;font-size:12px;cursor:pointer;padding:4px 8px;font-weight:700;" title="11월 요약 편집">✏️</button>
+            <div class="arr">→</div>
+          </div>
+        </div>
+        <div class="mc-body">
+          <div class="kw">월별 주요 업무 요약</div>
+          <div class="sum-list" id="sumList_11">
+        <div class="sum-row">
+          <span class="sum-dot c1"></span>
+          <span class="sum-cat">프랜차이즈 일괄징수</span>
+          <span class="sum-text">전국 운영 모델 정착 확인</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c2"></span>
+          <span class="sum-cat">중앙회 협력</span>
+          <span class="sum-text">중앙회 자율납부 안정화</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c7"></span>
+          <span class="sum-cat">시스템 개발</span>
+          <span class="sum-text">시스템 안정화 운영</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c3"></span>
+          <span class="sum-cat">대상업소 개발 / 전국 확대</span>
+          <span class="sum-text">지역센터 징수 성과 집계</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c4"></span>
+          <span class="sum-cat">KOMCA 공연권</span>
+          <span class="sum-text">KOMCA 실징수 지속</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c5"></span>
+          <span class="sum-cat">정책과제</span>
+          <span class="sum-text">시행령 개정 추진 지속</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c6"></span>
+          <span class="sum-cat">홍보·커뮤니케이션</span>
+          <span class="sum-text">SNS 채널 · KOMCA 위탁 이슈화</span>
+        </div>
+      </div>
+        </div></div><div class="month-card">
+        <div class="mc-head" style="background:linear-gradient(135deg, #2c3e6b, #111d3d)">
+          <div>
+            <div class="mnum">12</div>
+            <div class="mname">12월</div>
+            <div style="font-size:13px;opacity:0.92;margin-top:4px;font-weight:600;letter-spacing:0.5px;">🎉 한 해를 빛낸 LIV, 내년도 함께 달려봐요!</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button onclick="event.stopPropagation();openSummaryEdit(12)" class="admin-only" style="display:inline-block;background:rgba(255,255,255,0.25);border:none;border-radius:6px;
+              color:white;font-size:12px;cursor:pointer;padding:4px 8px;font-weight:700;" title="12월 요약 편집">✏️</button>
+            <div class="arr">→</div>
+          </div>
+        </div>
+        <div class="mc-body">
+          <div class="kw">월별 주요 업무 요약</div>
+          <div class="sum-list" id="sumList_12">
+        <div class="sum-row">
+          <span class="sum-dot c1"></span>
+          <span class="sum-cat">프랜차이즈 일괄징수</span>
+          <span class="sum-text">전국 징수 운영 모델 완전 정착</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c2"></span>
+          <span class="sum-cat">중앙회 협력</span>
+          <span class="sum-text">중앙회 자율납부 확대 완료</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c7"></span>
+          <span class="sum-cat">시스템 개발</span>
+          <span class="sum-text">전국 시스템 안정화 완료</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c3"></span>
+          <span class="sum-cat">대상업소 개발 / 전국 확대</span>
+          <span class="sum-text">지역센터 최종 성과 확보</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c4"></span>
+          <span class="sum-cat">KOMCA 공연권</span>
+          <span class="sum-text">KOMCA 연간 결산 완료</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c5"></span>
+          <span class="sum-cat">정책과제</span>
+          <span class="sum-text">국고지원금 집행·정산·보고 완료</span>
+        </div>
+      
+        <div class="sum-row">
+          <span class="sum-dot c6"></span>
+          <span class="sum-cat">홍보·커뮤니케이션</span>
+          <span class="sum-text">연말 사업 성과 전체 확산</span>
+        </div>
+      </div>
+        </div></div></div></div>
 </div>
 
 <!-- MONTH VIEW -->
@@ -690,26 +1625,54 @@ body {
       <button class="nav-btn back" onclick="changeMonth(-1)">◀ 이전 달</button>
     </div>
     <div class="month-nav-center">
-      <h2 id="monthTitle"></h2>
-      <span class="phase-pill" id="phaseBadge"></span>
+      <h2 id="monthTitle" style="background-image: linear-gradient(135deg, rgb(168, 213, 162), rgb(90, 158, 82)); background-clip: text; -webkit-text-fill-color: transparent;">2026년 3월</h2>
+      <span class="phase-pill" id="phaseBadge" style="background: linear-gradient(135deg, rgb(168, 213, 162), rgb(90, 158, 82));">1분기 기반 구축 단계</span>
     </div>
     <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end;">
       <button class="nav-btn schedule-btn" id="scheduleBtn" onclick="showSchedule()">🚗 출장·내근 스케줄 보기</button>
       <button class="nav-btn" onclick="changeMonth(1)">다음 달 ▶</button>
     </div>
   </div>
-  <div id="monthContent"></div>
+  <div id="monthContent"><div class="weekly-section"><div class="sec-title">📋 이번 달 주간별 주요 업무</div><div class="weeks-grid"><div class="week-card wk1">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+        <div class="wk-label">1주차</div>
+        <button onclick="openWeekEdit(3,0)" class="admin-only" style="display:none;background:rgba(255,255,255,0.3);border:none;border-radius:6px;
+          cursor:pointer;font-size:11px;padding:3px 7px;font-weight:700;" title="편집">✏️</button>
+      </div>
+      <ul><li>프랜차이즈 본사 접촉 및 업무협의 개시</li><li>출장계획 수립</li></ul>
+    </div><div class="week-card wk2">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+        <div class="wk-label">2주차</div>
+        <button onclick="openWeekEdit(3,1)" class="admin-only" style="display:none;background:rgba(255,255,255,0.3);border:none;border-radius:6px;
+          cursor:pointer;font-size:11px;padding:3px 7px;font-weight:700;" title="편집">✏️</button>
+      </div>
+      <ul><li>유·단·노 중앙회 MOU 초안 도출</li><li>서초구 현장 방문 개발 업무 개시</li></ul>
+    </div><div class="week-card wk3">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+        <div class="wk-label">3주차</div>
+        <button onclick="openWeekEdit(3,2)" class="admin-only" style="display:none;background:rgba(255,255,255,0.3);border:none;border-radius:6px;
+          cursor:pointer;font-size:11px;padding:3px 7px;font-weight:700;" title="편집">✏️</button>
+      </div>
+      <ul><li>KOMCA 위탁 실무협의 지속</li><li>국고지원사업 기획안 완성</li><li>서초구 지역 유단노 방문</li></ul>
+    </div><div class="week-card wk4">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+        <div class="wk-label">4주차</div>
+        <button onclick="openWeekEdit(3,3)" class="admin-only" style="display:none;background:rgba(255,255,255,0.3);border:none;border-radius:6px;
+          cursor:pointer;font-size:11px;padding:3px 7px;font-weight:700;" title="편집">✏️</button>
+      </div>
+      <ul><li>홍보 실행 로드맵 수립 완료</li><li>서초구 지역 현장방문 개발 업무 개시</li></ul>
+    </div></div></div><div class="cal-section"><table style="width: 100%; border-collapse: collapse; table-layout: fixed;"><thead><tr><th style="padding: 11px 4px; text-align: center; font-size: 13px; font-weight: 700; color: white; width: 14.2857%; background: rgb(239, 68, 68);">일</th><th style="padding: 11px 4px; text-align: center; font-size: 13px; font-weight: 700; color: white; width: 14.2857%; background: rgb(91, 115, 232);">월</th><th style="padding: 11px 4px; text-align: center; font-size: 13px; font-weight: 700; color: white; width: 14.2857%; background: rgb(91, 115, 232);">화</th><th style="padding: 11px 4px; text-align: center; font-size: 13px; font-weight: 700; color: white; width: 14.2857%; background: rgb(91, 115, 232);">수</th><th style="padding: 11px 4px; text-align: center; font-size: 13px; font-weight: 700; color: white; width: 14.2857%; background: rgb(91, 115, 232);">목</th><th style="padding: 11px 4px; text-align: center; font-size: 13px; font-weight: 700; color: white; width: 14.2857%; background: rgb(91, 115, 232);">금</th><th style="padding: 11px 4px; text-align: center; font-size: 13px; font-weight: 700; color: white; width: 14.2857%; background: rgb(245, 158, 11);">토</th></tr></thead><tbody><tr><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(239, 68, 68);">1</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">2</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">3</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">4</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">5</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; background: rgb(91, 115, 232); color: white;">6</span></td><td style="border-right: none; border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(245, 158, 11);">7</span></td></tr><tr><td colspan="1" style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white;"></td><td colspan="5" style="padding: 2px 3px; border-bottom: 1px solid rgb(240, 240, 240); vertical-align: middle;"><div class="ev-bar ev-c1" title="프랜차이즈 본사 접촉 및 업무협의 개시">프랜차이즈 본사 접촉 및 업무협의 개시</div></td><td colspan="1" style="border-left: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white; border-right: none;"></td></tr><tr><td colspan="1" style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white;"></td><td colspan="5" style="padding: 2px 3px; border-bottom: 1px solid rgb(240, 240, 240); vertical-align: middle;"><div class="ev-bar ev-c2" title="출장계획 수립">출장계획 수립</div></td><td colspan="1" style="border-left: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white; border-right: none;"></td></tr><tr><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(239, 68, 68);">8</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">9</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">10</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">11</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">12</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">13</span></td><td style="border-right: none; border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(245, 158, 11);">14</span></td></tr><tr><td colspan="1" style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white;"></td><td colspan="5" style="padding: 2px 3px; border-bottom: 1px solid rgb(240, 240, 240); vertical-align: middle;"><div class="ev-bar ev-c1" title="유·단·노 중앙회 MOU 초안 도출">유·단·노 중앙회 MOU 초안 도출</div></td><td colspan="1" style="border-left: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white; border-right: none;"></td></tr><tr><td colspan="1" style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white;"></td><td colspan="5" style="padding: 2px 3px; border-bottom: 1px solid rgb(240, 240, 240); vertical-align: middle;"><div class="ev-bar ev-c2" title="서초구 현장 방문 개발 업무 개시">서초구 현장 방문 개발 업무 개시</div></td><td colspan="1" style="border-left: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white; border-right: none;"></td></tr><tr><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(239, 68, 68);">15</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">16</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">17</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">18</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">19</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">20</span></td><td style="border-right: none; border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(245, 158, 11);">21</span></td></tr><tr><td colspan="1" style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white;"></td><td colspan="5" style="padding: 2px 3px; border-bottom: 1px solid rgb(240, 240, 240); vertical-align: middle;"><div class="ev-bar ev-c1" title="KOMCA 위탁 실무협의 지속">KOMCA 위탁 실무협의 지속</div></td><td colspan="1" style="border-left: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white; border-right: none;"></td></tr><tr><td colspan="1" style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white;"></td><td colspan="5" style="padding: 2px 3px; border-bottom: 1px solid rgb(240, 240, 240); vertical-align: middle;"><div class="ev-bar ev-c2" title="국고지원사업 기획안 완성">국고지원사업 기획안 완성</div></td><td colspan="1" style="border-left: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white; border-right: none;"></td></tr><tr><td colspan="1" style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white;"></td><td colspan="5" style="padding: 2px 3px; border-bottom: 1px solid rgb(240, 240, 240); vertical-align: middle;"><div class="ev-bar ev-c3" title="서초구 지역 유단노 방문">서초구 지역 유단노 방문</div></td><td colspan="1" style="border-left: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white; border-right: none;"></td></tr><tr><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(239, 68, 68);">22</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">23</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">24</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">25</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">26</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">27</span></td><td style="border-right: none; border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(245, 158, 11);">28</span></td></tr><tr><td colspan="1" style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white;"></td><td colspan="5" style="padding: 2px 3px; border-bottom: 1px solid rgb(240, 240, 240); vertical-align: middle;"><div class="ev-bar ev-c1" title="홍보 실행 로드맵 수립 완료">홍보 실행 로드맵 수립 완료</div></td><td colspan="1" style="border-left: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white; border-right: none;"></td></tr><tr><td colspan="1" style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white;"></td><td colspan="5" style="padding: 2px 3px; border-bottom: 1px solid rgb(240, 240, 240); vertical-align: middle;"><div class="ev-bar ev-c2" title="서초구 지역 현장방문 개발 업무 개시">서초구 지역 현장방문 개발 업무 개시</div></td><td colspan="1" style="border-left: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 2px; background: white; border-right: none;"></td></tr><tr><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(239, 68, 68);">29</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">30</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: white; vertical-align: top; height: 28px; cursor: pointer; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(85, 85, 85);">31</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: rgb(250, 250, 250); vertical-align: top; height: 28px; cursor: default; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(204, 204, 204);">1</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: rgb(250, 250, 250); vertical-align: top; height: 28px; cursor: default; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(204, 204, 204);">2</span></td><td style="border-right: 1px solid rgb(240, 240, 240); border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: rgb(250, 250, 250); vertical-align: top; height: 28px; cursor: default; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(204, 204, 204);">3</span></td><td style="border-right: none; border-bottom: 1px solid rgb(240, 240, 240); padding: 5px 6px 2px; background: rgb(250, 250, 250); vertical-align: top; height: 28px; cursor: default; transition: background 0.15s;"><span style="font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; border-radius: 50%; color: rgb(204, 204, 204);">4</span></td></tr></tbody></table><div class="legend-bar"><div class="leg-item"><div class="leg-dot" style="background:#7c3aed"></div>프랜차이즈 일괄징수</div><div class="leg-item"><div class="leg-dot" style="background:#0ea5e9"></div>중앙회 협력</div><div class="leg-item"><div class="leg-dot" style="background:#16a34a"></div>대상업소 개발 / 전국 확대</div><div class="leg-item"><div class="leg-dot" style="background:#ec4899"></div>KOMCA 공연권</div><div class="leg-item"><div class="leg-dot" style="background:#f97316"></div>정책과제</div><div class="leg-item"><div class="leg-dot" style="background:#0891b2"></div>홍보·커뮤니케이션</div><div class="leg-item"><div class="leg-dot" style="background:#8b5cf6"></div>시스템 개발</div><div class="leg-item"><div class="leg-dot" style="background:#6366f1"></div>회계</div></div></div></div>
 </div>
 
 <!-- SCHEDULE VIEW (livemusic_schedule 연계) -->
-<div id="scheduleView" class="view">
+<div id="scheduleView" class="view active">
   <div class="month-nav">
     <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-start;">
       <button class="nav-btn year-btn" onclick="showYear()">🗓 연간 달력</button>
       <button class="nav-btn back" onclick="backToMonth()">◀ 사업계획으로</button>
     </div>
     <div class="month-nav-center">
-      <h2 id="scheduleTitle"></h2>
+      <h2 id="scheduleTitle" style="background-image: linear-gradient(135deg, rgb(168, 213, 162), rgb(90, 158, 82)); background-clip: text; -webkit-text-fill-color: transparent;">2026년 3월</h2>
       <span class="phase-pill" style="background:linear-gradient(90deg,#ec4899,#f97316)">출장 및 내근 스케줄</span>
     </div>
     <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end;">
@@ -717,7 +1680,66 @@ body {
       <button class="nav-btn" onclick="changeScheduleMonth(1)">다음 달 ▶</button>
     </div>
   </div>
-  <div id="scheduleContent"></div>
+  <div id="scheduleContent"><div class="sch-container" style="border-top: 4px solid rgb(90, 158, 82);">
+    <h3 id="schSectionTitleEl" style="font-size:15px;font-weight:800;background:linear-gradient(135deg, #a8d5a2, #5a9e52);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:12px;cursor:pointer;" onclick="openSchSectionEdit()">💼 2026년 3월 출장·내근 운영 계획  ✏️</h3>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;"><div style="background:#fdf4ff;border-radius:10px;padding:14px;border-left:4px solid #ec4899;position:relative;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+        <div style="font-weight:700;color:#ec4899;">🚗 외근 주요 업무</div>
+        <button onclick="openSchGuideEdit('2026_3','out','#ec4899')" style="background:rgba(255,255,255,0.35);border:none;border-radius:6px;cursor:pointer;font-size:11px;padding:3px 7px;font-weight:700;" title="편집">✏️</button>
+      </div>
+      <div style="font-size:12px;color:#555;line-height:1.8;"><b>연체 확인:</b> 미납 업소 방문 독촉 및 미납 사유 파악<br><b>신규 개발:</b> 신규 영업장 공연권료 징수 안내 및 홍보</div>
+    </div><div style="background:#eff6ff;border-radius:10px;padding:14px;border-left:4px solid #0ea5e9;position:relative;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+        <div style="font-weight:700;color:#0ea5e9;">💻 내근 주요 업무</div>
+        <button onclick="openSchGuideEdit('2026_3','in','#0ea5e9')" style="background:rgba(255,255,255,0.35);border:none;border-radius:6px;cursor:pointer;font-size:11px;padding:3px 7px;font-weight:700;" title="편집">✏️</button>
+      </div>
+      <div style="font-size:12px;color:#555;line-height:1.8;"><b>자료 정리:</b> 외근 시 파악된 현장 정보 등록<br><b>전화 상담:</b> 아웃바운드 콜 - 연체 사실 고지 및 사유 파악<br><b>문자 및 알림톡:</b> 미납업소 및 신규개발업소에 발송<br><b>독촉장:</b> 장기미납업소 상대로 독촉장 발송</div>
+    </div><div style="background:#f0fdf4;border-radius:10px;padding:14px;border-left:4px solid #16a34a;position:relative;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+        <div style="font-weight:700;color:#16a34a;">📊 금요일 업무</div>
+        <button onclick="openSchGuideEdit('2026_3','fri','#16a34a')" style="background:rgba(255,255,255,0.35);border:none;border-radius:6px;cursor:pointer;font-size:11px;padding:3px 7px;font-weight:700;" title="편집">✏️</button>
+      </div>
+      <div style="font-size:12px;color:#555;line-height:1.8;"><b>이월 외근:</b> 조정된 외근 업무 우선 실시<br><b>성과 취합:</b> 주간 성과 취합 및 미진 업무 보완<br><b>주간보고:</b> 금주업무보고 및 차주 업부계획보고</div>
+    </div></div>
+  </div><div class="sch-container">
+    <div class="sch-grid">
+      <div class="sch-head sun">일</div>
+      <div class="sch-head" style="background:#5a9e52">월</div>
+      <div class="sch-head" style="background:#5a9e52">화</div>
+      <div class="sch-head" style="background:#5a9e52">수</div>
+      <div class="sch-head" style="background:#5a9e52">목</div>
+      <div class="sch-head" style="background:#5a9e52">금</div>
+      <div class="sch-head sat">토</div>
+    </div>
+    <div class="sch-grid" id="schDays"><div class="sch-day sun-d" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#dc2626;font-weight:700;font-size:14px;">1</div><div style="color:#bbb;text-align:center;padding:8px;font-size:11px;">휴무</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">2</div><div style="color:#ff6b6b;text-align:center;padding:8px;font-weight:700;font-size:11px;">🎌 대체휴일<br>휴무</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">3</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">4</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">5</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day today-sch" style="border: 2px solid rgb(90, 158, 82); box-shadow: rgba(90, 158, 82, 0.333) 0px 0px 10px; background: rgb(255, 255, 255); cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:50%;background:#5a9e52;color:white;font-weight:900;font-size:13px;">6</div><div class="routine-d" style="background:#a8d5a230;color:#5a9e52;border-left:3px solid #5a9e52;font-size:10px;padding:4px 6px;">📊 금요일 특별운영<br>• 이월 외근 수행<br>• 주간 성과 취합</div><div style="margin-top:3px;cursor:pointer;display:flex;align-items:center;gap:3px;flex-wrap:wrap;" onclick="event.stopPropagation();openMemberDetail(3,6,'연성흠')">
+          <span style="font-size:9px;font-weight:800;color:#0ea5e9;">연성흠</span><span style="background:#0ea5e9;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">내근</span> <span style="background:#06b6d4;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">오전출근</span>
+        </div><div style="margin-top:3px;cursor:pointer;display:flex;align-items:center;gap:3px;flex-wrap:wrap;" onclick="event.stopPropagation();openMemberDetail(3,6,'유남영')">
+          <span style="font-size:9px;font-weight:800;color:#0ea5e9;">유남영</span><span style="background:#0ea5e9;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">내근</span> <span style="background:#06b6d4;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">오전출근</span>
+        </div><div style="margin-top:3px;cursor:pointer;display:flex;align-items:center;gap:3px;flex-wrap:wrap;" onclick="event.stopPropagation();openMemberDetail(3,6,'김동희')">
+          <span style="font-size:9px;font-weight:800;color:#0ea5e9;">김동희</span><span style="background:#0ea5e9;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">내근</span> <span style="background:#06b6d4;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">오전출근</span>
+        </div><div style="margin-top:3px;cursor:pointer;display:flex;align-items:center;gap:3px;flex-wrap:wrap;" onclick="event.stopPropagation();openMemberDetail(3,6,'박재훈')">
+          <span style="font-size:9px;font-weight:800;color:#0ea5e9;">박재훈</span><span style="background:#0ea5e9;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">내근</span> <span style="background:#06b6d4;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">오전출근</span>
+        </div><div style="margin-top:3px;cursor:pointer;display:flex;align-items:center;gap:3px;flex-wrap:wrap;" onclick="event.stopPropagation();openMemberDetail(3,6,'김훈기')">
+          <span style="font-size:9px;font-weight:800;color:#0ea5e9;">김훈기</span><span style="background:#0ea5e9;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">내근</span> <span style="background:#06b6d4;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">오전출근</span>
+        </div></div><div class="sch-day sat-d" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#d97706;font-weight:700;font-size:14px;">7</div><div style="color:#bbb;text-align:center;padding:8px;font-size:11px;">휴무</div></div><div class="sch-day sun-d" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#dc2626;font-weight:700;font-size:14px;">8</div><div style="color:#bbb;text-align:center;padding:8px;font-size:11px;">휴무</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">9</div><div style="margin-top:3px;cursor:pointer;display:flex;align-items:center;gap:3px;flex-wrap:wrap;" onclick="event.stopPropagation();openMemberDetail(3,9,'연성흠')">
+          <span style="font-size:9px;font-weight:800;color:#f5576c;">연성흠</span><span style="background:#f5576c;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">외근</span> <span style="background:#7c3aed;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">오후출근</span>
+        </div><div style="margin-top:3px;cursor:pointer;display:flex;align-items:center;gap:3px;flex-wrap:wrap;" onclick="event.stopPropagation();openMemberDetail(3,9,'유남영')">
+          <span style="font-size:9px;font-weight:800;color:#0ea5e9;">유남영</span><span style="background:#0ea5e9;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">내근</span> <span style="background:#06b6d4;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">오전출근</span>
+        </div><div style="margin-top:3px;cursor:pointer;display:flex;align-items:center;gap:3px;flex-wrap:wrap;" onclick="event.stopPropagation();openMemberDetail(3,9,'김동희')">
+          <span style="font-size:9px;font-weight:800;color:#0ea5e9;">김동희</span><span style="background:#0ea5e9;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">내근</span> <span style="background:#06b6d4;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">오전출근</span>
+        </div><div style="margin-top:3px;cursor:pointer;display:flex;align-items:center;gap:3px;flex-wrap:wrap;" onclick="event.stopPropagation();openMemberDetail(3,9,'박재훈')">
+          <span style="font-size:9px;font-weight:800;color:#f5576c;">박재훈</span><span style="background:#f5576c;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">외근</span> <span style="background:#7c3aed;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">오후출근</span>
+        </div><div style="margin-top:3px;cursor:pointer;display:flex;align-items:center;gap:3px;flex-wrap:wrap;" onclick="event.stopPropagation();openMemberDetail(3,9,'김훈기')">
+          <span style="font-size:9px;font-weight:800;color:#0ea5e9;">김훈기</span><span style="background:#0ea5e9;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">내근</span> <span style="background:#06b6d4;color:white;border-radius:4px;padding:1px 5px;font-size:8px;font-weight:700;">오전출근</span>
+        </div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">10</div><div class="special-d">📱 알림톡 발송일</div><div class="routine-d" style="background:#a8d5a220;color:#5a9e52;border-left:3px solid #5a9e52;font-size:10px;padding:4px 6px;">전원 내근<br>상담 및 독촉 집중</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">11</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">12</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">13</div><div class="routine-d" style="background:#a8d5a230;color:#5a9e52;border-left:3px solid #5a9e52;font-size:10px;padding:4px 6px;">📊 금요일 특별운영<br>• 이월 외근 수행<br>• 주간 성과 취합</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day sat-d" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#d97706;font-weight:700;font-size:14px;">14</div><div style="color:#bbb;text-align:center;padding:8px;font-size:11px;">휴무</div></div><div class="sch-day sun-d" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#dc2626;font-weight:700;font-size:14px;">15</div><div style="color:#bbb;text-align:center;padding:8px;font-size:11px;">휴무</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">16</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">17</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">18</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">19</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">20</div><div class="routine-d" style="background:#a8d5a230;color:#5a9e52;border-left:3px solid #5a9e52;font-size:10px;padding:4px 6px;">📊 금요일 특별운영<br>• 이월 외근 수행<br>• 주간 성과 취합</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day sat-d" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#d97706;font-weight:700;font-size:14px;">21</div><div style="color:#bbb;text-align:center;padding:8px;font-size:11px;">휴무</div></div><div class="sch-day sun-d" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#dc2626;font-weight:700;font-size:14px;">22</div><div style="color:#bbb;text-align:center;padding:8px;font-size:11px;">휴무</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">23</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">24</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">25</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">26</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">27</div><div class="routine-d" style="background:#a8d5a230;color:#5a9e52;border-left:3px solid #5a9e52;font-size:10px;padding:4px 6px;">📊 금요일 특별운영<br>• 이월 외근 수행<br>• 주간 성과 취합</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day sat-d" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#d97706;font-weight:700;font-size:14px;">28</div><div style="color:#bbb;text-align:center;padding:8px;font-size:11px;">휴무</div></div><div class="sch-day sun-d" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#dc2626;font-weight:700;font-size:14px;">29</div><div style="color:#bbb;text-align:center;padding:8px;font-size:11px;">휴무</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">30</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day" style="cursor: pointer; transition: box-shadow 0.15s;"><div class="dn2" style="color:#5a9e52;font-weight:700;font-size:14px;">31</div><div style="color:#bbb;font-size:9px;margin-top:4px;text-align:center;">✏️ 클릭하여 입력</div></div><div class="sch-day other"><div class="dn2">1</div></div><div class="sch-day other"><div class="dn2">2</div></div><div class="sch-day other"><div class="dn2">3</div></div><div class="sch-day other"><div class="dn2">4</div></div><div class="sch-day other"><div class="dn2">5</div></div><div class="sch-day other"><div class="dn2">6</div></div><div class="sch-day other"><div class="dn2">7</div></div><div class="sch-day other"><div class="dn2">8</div></div><div class="sch-day other"><div class="dn2">9</div></div><div class="sch-day other"><div class="dn2">10</div></div><div class="sch-day other"><div class="dn2">11</div></div></div>
+    <div class="sch-legend">
+      <div class="sch-leg-item"><div class="sch-leg-dot" style="background:linear-gradient(135deg,#f5576c,#f093fb)"></div>외근</div>
+      <div class="sch-leg-item"><div class="sch-leg-dot" style="background:linear-gradient(135deg,#43e7f5,#0ea5e9)"></div>내근</div>
+      <div class="sch-leg-item"><div class="sch-leg-dot" style="background:linear-gradient(135deg,#fa709a,#fee140)"></div>알림톡 발송일</div>
+      <div class="sch-leg-item"><div class="sch-leg-dot" style="background:#a8d5a2;border:1px solid #5a9e52"></div>금요일 특별운영</div>
+      <div class="sch-leg-item"><div class="sch-leg-dot" style="background:#ff6b6b"></div>대체휴일</div>
+    </div>
+  </div></div>
 </div>
 
 <script>
@@ -983,7 +2005,7 @@ const SCH_NAMES = _rawNames;
 function saveSchNames() { localStorage.setItem('schNames', JSON.stringify(SCH_NAMES)); }
 
 // 고정 팀원 4명
-const TEAM_MEMBERS = ['연성흠', '유남영', '김동희', '박제훈', '김훈기'];
+const TEAM_MEMBERS = ['연성흠', '유남영', '김동희', '박재훈', '김훈기'];
 // 상태: out=외근, in=내근, annual=연차, am=오전반차, pm=오후반차
 const STATUS_LABELS = { out:'🚗 외근', in:'💻 내근', annual:'🌴 연차', am:'🌅 오전반차', pm:'🌇 오후반차', lateam:'🌄 오전출근', latepm:'🌆 오후출근' };
 const STATUS_COLORS = { out:'#f5576c', in:'#0ea5e9', annual:'#16a34a', am:'#f59e0b', pm:'#8b5cf6', lateam:'#06b6d4', latepm:'#7c3aed' };
@@ -2723,5 +3745,6 @@ function saveSchSectionEdit() {
 }
 
 </script>
-</body>
-</html>
+
+
+</body></html>
